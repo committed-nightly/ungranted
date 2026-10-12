@@ -1,0 +1,51 @@
+name: scope probe
+
+# Scratch branch only. Measures what each permissions: block actually buys,
+# so ungranted's scope table is a record of the API's behaviour rather than
+# a reading of the docs. Deleted once the answers are in the README.
+'on':
+  push:
+    branches: ['scratch/**']
+
+jobs:
+  empty-block:
+    runs-on: ubuntu-latest
+    permissions: {}
+    env: { PROBE_LABEL: 'permissions: {}', GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
+    steps:
+      - uses: actions/checkout@v4
+      - run: probe/probe.sh
+
+  contents-read:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env: { PROBE_LABEL: 'contents: read', GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
+    steps:
+      - uses: actions/checkout@v4
+      - run: probe/probe.sh
+
+  actions-read:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    env: { PROBE_LABEL: 'contents: read + actions: read', GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
+    steps:
+      - uses: actions/checkout@v4
+      - run: probe/probe.sh
+
+  everything-read:
+    runs-on: ubuntu-latest
+    permissions: read-all
+    env: { PROBE_LABEL: 'read-all', GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
+    steps:
+      - uses: actions/checkout@v4
+      - run: probe/probe.sh
+
+  no-block-at-all:
+    runs-on: ubuntu-latest
+    env: { PROBE_LABEL: 'no permissions: key anywhere', GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
+    steps:
+      - uses: actions/checkout@v4
+      - run: probe/probe.sh

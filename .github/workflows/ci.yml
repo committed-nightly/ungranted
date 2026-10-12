@@ -33,6 +33,11 @@ jobs:
       - run: pip install ruff
       - run: ruff check .
 
+      # probe/probe.sh is how the scope table was measured, so it gets linted
+      # like everything else. shellcheck is preinstalled on the runner.
+      - name: shellcheck
+        run: shellcheck probe/probe.sh
+
   actionlint:
     runs-on: ubuntu-latest
     steps:
