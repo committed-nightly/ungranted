@@ -47,6 +47,27 @@ TOKEN_NONE = "none"
 # Variables gh reads for its token, in the order gh reads them.
 GH_TOKEN_VARS = ("GH_TOKEN", "GITHUB_TOKEN")
 
+# Words that stand in front of a command without being one. `if gh api ...`
+# must be read as a `gh api`, and `CODE=0 gh pr list` as a `gh pr list`.
+_LEADING_KEYWORDS = frozenset(
+    {
+        "if", "then", "else", "elif", "fi", "for", "while", "until", "do",
+        "done", "case", "esac", "function", "time", "!", "{", "}", "[[",
+        "command", "exec", "nohup", "sudo", "eval",
+    }
+)
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def command_words(tokens: list[str]) -> list[str]:
+    """Strip leading keywords and variable assignments to find the real command."""
+    i = 0
+    while i < len(tokens) and (
+        tokens[i] in _LEADING_KEYWORDS or _ASSIGNMENT.match(tokens[i])
+    ):
+        i += 1
+    return tokens[i:]
+
 _SEPARATORS = ("&&", "||", ";", "|", "\n", "(", ")", "{", "}", "&")
 
 
@@ -101,6 +122,33 @@ def classify_token_value(value: str) -> str:
     return TOKEN_NONE
 
 
+_HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def strip_heredocs(script: str) -> str:
+    """Remove heredoc bodies, keeping the command that opened them.
+
+    A heredoc body is data. CI scripts are full of them -- `python - <<'PY'`
+    is how half the steps in this org assert anything -- and read as commands
+    they produce a line of nonsense per line of Python.
+    """
+    lines = script.splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        match = _HEREDOC.search(line)
+        i += 1
+        if not match:
+            continue
+        terminator = match.group(2)
+        while i < len(lines) and lines[i].strip() != terminator:
+            i += 1
+        i += 1  # drop the terminator line too
+    return "\n".join(out)
+
+
 def commands(script: str) -> list[list[str]]:
     """Split a `run:` body into tokenised commands.
 
@@ -108,7 +156,7 @@ def commands(script: str) -> list[list[str]]:
     tokenise at all -- an unbalanced quote, usually inside a heredoc -- is
     dropped rather than raised on: a heredoc body is data, not a command.
     """
-    joined = re.sub(r"\\\n", " ", script)
+    joined = re.sub(r"\\\n", " ", strip_heredocs(script))
     pieces: list[str] = []
     current: list[str] = []
     quote: str | None = None
@@ -125,6 +173,12 @@ def commands(script: str) -> list[list[str]]:
             quote = char
             current.append(char)
             i += 1
+            continue
+        if char == "#" and (not current or current[-1].isspace()):
+            # A comment runs to the end of the line. Without this, the `#` and
+            # every word after it read as a command.
+            newline = joined.find("\n", i)
+            i = len(joined) if newline == -1 else newline
             continue
         for separator in _SEPARATORS:
             if joined.startswith(separator, i):
