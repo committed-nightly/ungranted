@@ -92,3 +92,24 @@ def test_split_path_marks_unresolvable_segments():
     assert segments[0] == "repos"
     assert segments[2] != "$R"  # normalised, not left as text
     assert segments[-1] == "file"
+
+
+def test_the_settable_list_matches_actionlint():
+    """The one list that has a second authority to check against.
+
+    actionlint 1.7.12 prints every scope it will accept when it rejects one.
+    If these two disagree, one of us is telling people to write a key GitHub
+    will not take, or rejecting one it will. The first draft of this table was
+    missing `artifact-metadata` and `repository-projects`, which actionlint
+    caught.
+    """
+    from ungranted.scopes import SETTABLE
+
+    actionlint = {
+        "actions", "artifact-metadata", "attestations", "checks", "contents",
+        "deployments", "discussions", "id-token", "issues", "models",
+        "packages", "pages", "pull-requests", "repository-projects",
+        "security-events", "statuses",
+    }
+    assert set(SETTABLE) == actionlint
+    assert METADATA not in SETTABLE  # implicit, and GitHub rejects the key

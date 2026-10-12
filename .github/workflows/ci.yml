@@ -1,0 +1,161 @@
+name: CI
+
+'on':
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e ".[dev]"
+      - run: pytest -q
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install ruff
+      - run: ruff check .
+
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: actionlint
+        run: |
+          bash <(curl -sSf https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color
+
+  dogfood:
+    # The README quotes this output and rests its whole premise on actionlint
+    # passing a file this rejects. If either stops being true, the README is
+    # wrong, and a README that no longer describes the tool is the thing this
+    # job exists to catch.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -e .
+
+      - name: actionlint still passes the file the README says it passes
+        # The comparison the first section of the README is built on. If
+        # actionlint learns this check, that section needs rewriting rather
+        # than quietly staying up.
+        run: |
+          bash <(curl -sSf https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint --version | head -1
+          ./actionlint examples/under.yaml
+          echo "actionlint exits 0 on examples/under.yaml, as the README says"
+
+      - name: and ungranted does not
+        run: |
+          code=0
+          ungranted examples/under.yaml > under.txt || code=$?
+          cat under.txt
+          test "$code" -eq 1 || { echo "expected exit 1, got $code"; exit 1; }
+          grep -q 'gh api repos/o/r/actions/workflows needs actions: read; this job has actions: none' under.txt
+          grep -q 'in step: count the workflows' under.txt
+
+      - name: the worked example says what the README says it says
+        run: |
+          code=0
+          ungranted examples > out.txt || code=$?
+          cat out.txt
+          test "$code" -eq 1 || { echo "expected exit 1, got $code"; exit 1; }
+          grep -qx '7 findings in 5 of 6 jobs.' out.txt
+          # The three findings the README calls out by name.
+          grep -q 'actions/checkout needs contents: read; this job has contents: none' out.txt
+          grep -q 'needs statuses: write; this job has statuses: none' out.txt
+          grep -q 'contents: write is granted and every call here only reads' out.txt
+          grep -qx '    covered' out.txt
+
+      - name: the two calls this must not report are not reported
+        # A different secret and a missing token are both false positives if
+        # they turn up as findings. This is the assertion that keeps them out.
+        run: |
+          ungranted examples -q > findings.txt || test $? -le 1
+          cat findings.txt
+          if grep -q 'merge-upstream' findings.txt; then
+            echo "reported a call made with somebody else's secret"; exit 1
+          fi
+          if grep -q 'mirror: ungranted' findings.txt; then
+            echo "reported a step that has no token as a permissions problem"; exit 1
+          fi
+          ungranted examples | grep -q 'authenticated with a different secret'
+          ungranted examples | grep -q 'nothing in scope sets GH_TOKEN'
+
+      - name: a workflow with no permissions block is clean and exits 0
+        # The common safe case. If this ever starts reporting, the tool is
+        # unusable on the twenty-odd repositories in this org that have no
+        # block at all.
+        run: |
+          mkdir -p noblock/.github/workflows
+          cat > noblock/.github/workflows/ci.yml <<'YML'
+          name: ci
+          'on': push
+          jobs:
+            j:
+              runs-on: ubuntu-latest
+              steps:
+                - env: { GH_TOKEN: '${{ github.token }}' }
+                  run: gh api -X DELETE repos/o/r/git/refs/heads/gone
+          YML
+          ungranted noblock
+
+      - name: an unreadable path is exit 2 and not exit 0
+        # "Nobody looked" reported as a green tick is worse than no check.
+        run: |
+          mkdir -p unknown/.github/workflows
+          cat > unknown/.github/workflows/ci.yml <<'YML'
+          name: ci
+          'on': push
+          permissions:
+            contents: read
+          jobs:
+            j:
+              runs-on: ubuntu-latest
+              steps:
+                - env: { GH_TOKEN: '${{ github.token }}' }
+                  run: gh api "$ENDPOINT"
+          YML
+          code=0
+          ungranted unknown || code=$?
+          test "$code" -eq 2 || { echo "expected exit 2, got $code"; exit 1; }
+
+      - name: it passes its own workflows
+        # This file. Every job here declares a block, so there is no excuse.
+        run: ungranted . --strict
+
+      - name: json stays parseable and carries the needs
+        run: |
+          ungranted examples --json > out.json || test $? -le 1
+          python -c "
+          import json
+          d = json.load(open('out.json'))
+          jobs = {j['job']: j for j in d['jobs']}
+          assert jobs['summarise']['needs'] == [
+              {'scope': 'actions', 'level': 'read'},
+              {'scope': 'contents', 'level': 'read'},
+          ], jobs['summarise']['needs']
+          assert jobs['comment']['findings'] == [], jobs['comment']
+          assert jobs['mirror']['skipped'], jobs['mirror']
+          print('ok')
+          "

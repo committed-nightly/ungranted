@@ -35,6 +35,7 @@ from dataclasses import dataclass
 # actionlint catches it before the run.
 SETTABLE = (
     "actions",
+    "artifact-metadata",
     "attestations",
     "checks",
     "contents",
@@ -46,6 +47,7 @@ SETTABLE = (
     "packages",
     "pages",
     "pull-requests",
+    "repository-projects",
     "security-events",
     "statuses",
 )
@@ -86,10 +88,11 @@ AUDITABLE = frozenset(
 )
 
 # Scopes no key grants, but `read-all` and `write-all` do. The runner resolves
-# `read-all` to nineteen scopes, five of which have no key you can write:
-# ArtifactMetadata, CodeQuality, Drives, RepositoryProjects and
-# VulnerabilityAlerts. So `read-all` is not the union of SETTABLE, and some
-# endpoints are reachable with it and not by naming scopes.
+# `read-all` to nineteen scopes. `Metadata` is implicit, and three of the rest
+# -- CodeQuality, Drives and VulnerabilityAlerts -- have no key you can name.
+# So `read-all` is not the union of SETTABLE in either direction: it reaches
+# endpoints that naming scopes cannot, and it does not grant `id-token`, which
+# is settable and only meaningful as a write.
 GRANTED_ONLY_BY_ALL = frozenset({"dependabot-alerts"})
 
 READ = "read"
