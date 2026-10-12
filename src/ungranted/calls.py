@@ -131,6 +131,13 @@ def strip_heredocs(script: str) -> str:
     A heredoc body is data. CI scripts are full of them -- `python - <<'PY'`
     is how half the steps in this org assert anything -- and read as commands
     they produce a line of nonsense per line of Python.
+
+    Only strips when the terminator line is actually there. A real shell treats
+    an unterminated heredoc as running to the end of input, but `<<` also
+    appears in arithmetic, and `$(( a << b ))` looks exactly like a heredoc
+    opening with the word `b`. Requiring the terminator means the worst case is
+    that we read a few lines we should not have, rather than silently dropping
+    the rest of the script because somebody shifted an integer.
     """
     lines = script.splitlines()
     out: list[str] = []
@@ -143,9 +150,12 @@ def strip_heredocs(script: str) -> str:
         if not match:
             continue
         terminator = match.group(2)
-        while i < len(lines) and lines[i].strip() != terminator:
-            i += 1
-        i += 1  # drop the terminator line too
+        end = next(
+            (j for j in range(i, len(lines)) if lines[j].strip() == terminator), None
+        )
+        if end is None:
+            continue
+        i = end + 1  # drop the body and the terminator line
     return "\n".join(out)
 
 

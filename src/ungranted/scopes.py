@@ -266,7 +266,16 @@ def split_path(raw: str) -> tuple[str, ...]:
     return tuple(DYN if _is_dyn(s) else s for s in segments)
 
 
-def _match(segments: tuple[str, ...], pattern: tuple[str, ...]) -> bool:
+def _match(
+    segments: tuple[str, ...], pattern: tuple[str, ...], loose: bool = False
+) -> bool:
+    """Does this path match this pattern?
+
+    With ``loose``, an unresolved segment also matches a literal -- it asks
+    "could this path match, for some value of the variable?" rather than "does
+    it". The gap between the two answers is where the guessing would be, and
+    `classify` refuses rather than guess.
+    """
     i = 0
     for j, element in enumerate(pattern):
         if element == "**":
@@ -276,8 +285,9 @@ def _match(segments: tuple[str, ...], pattern: tuple[str, ...]) -> bool:
         if element == "*":
             i += 1
             continue
-        if segments[i] != element:  # a DYN segment lands here and fails
-            return False
+        if segments[i] != element:
+            if not (loose and segments[i] == DYN):
+                return False
         i += 1
     return i == len(segments)
 
@@ -315,13 +325,30 @@ def classify(raw: str, method: str = "GET") -> Need:
 
     if head == "repos":
         rest = _strip_repo(segments, raw)
-        for rule in _RULES:
-            if _match(rest, rule[0]):
-                scope = _scope_for(rule, level)
-                # A metadata-only read is always satisfied; a metadata "write"
-                # is not a thing, so those rules always name a real scope.
-                return Need(scope, READ if scope == METADATA else level)
-        raise UnknownPath(raw, "no rule for this /repos path")
+        strict = next((i for i, r in enumerate(_RULES) if _match(rest, r[0])), None)
+        loose = next(
+            (i for i, r in enumerate(_RULES) if _match(rest, r[0], loose=True)), None
+        )
+        if loose is None:
+            raise UnknownPath(raw, "no rule for this /repos path")
+        if strict is None or loose < strict:
+            # A variable sits where an earlier, narrower rule has a literal, so
+            # the answer depends on what the variable holds. `actions/$X/...`
+            # is the actions scope unless $X is `secrets` or `variables`, and
+            # the difference is between a scope you can grant and one you
+            # cannot. Answering the common case would be wrong exactly when it
+            # matters.
+            narrow = "/".join(_RULES[loose][0])
+            raise UnknownPath(
+                raw,
+                f"a variable in the path could make this {narrow!r}, which needs "
+                f"a different scope, so this cannot be read without running it",
+            )
+        rule = _RULES[strict]
+        scope = _scope_for(rule, level)
+        # A metadata-only read is always satisfied; a metadata "write" is not a
+        # thing, so those rules always name a real scope.
+        return Need(scope, READ if scope == METADATA else level)
 
     # Paths outside /repos. Short list on purpose: a workflow token is scoped
     # to one repository and most of these have the same answer every time.
