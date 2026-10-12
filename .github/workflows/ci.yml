@@ -107,42 +107,49 @@ jobs:
           ungranted examples | grep -q 'authenticated with a different secret'
           ungranted examples | grep -q 'nothing in scope sets GH_TOKEN'
 
+      - name: write the two fixtures
+        # Assembled in Python rather than written with a heredoc. Actions
+        # substitutes workflow expressions throughout a run: block before the
+        # shell ever sees it, quoted heredoc or not, so a fixture written that
+        # way gets the real token baked into it instead of the expression --
+        # and then the tool correctly says "no token in scope" and the
+        # assertion below passes for entirely the wrong reason. The first
+        # version of this job did exactly that, and the exit-2 check below is
+        # what caught it.
+        run: |
+          python - <<'PY'
+          import pathlib
+          token = "${" + "{ github.token }}"
+          head = "name: ci\n'on': push\n"
+          job = (
+              "jobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n"
+              "      - env: {{ GH_TOKEN: '{t}' }}\n        run: {cmd}\n"
+          )
+          for name, perms, cmd in [
+              ("noblock", "", "gh api -X DELETE repos/o/r/git/refs/heads/gone"),
+              ("unknown", "permissions:\n  contents: read\n", 'gh api "$ENDPOINT"'),
+          ]:
+              path = pathlib.Path(name, ".github", "workflows", "ci.yml")
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(head + perms + job.format(t=token, cmd=cmd))
+              print("---", path)
+              print(path.read_text())
+          PY
+          grep -q 'github.token' noblock/.github/workflows/ci.yml \
+            || { echo "the fixture lost the token expression"; exit 1; }
+
       - name: a workflow with no permissions block is clean and exits 0
         # The common safe case. If this ever starts reporting, the tool is
         # unusable on the twenty-odd repositories in this org that have no
         # block at all.
-        run: |
-          mkdir -p noblock/.github/workflows
-          cat > noblock/.github/workflows/ci.yml <<'YML'
-          name: ci
-          'on': push
-          jobs:
-            j:
-              runs-on: ubuntu-latest
-              steps:
-                - env: { GH_TOKEN: '${{ github.token }}' }
-                  run: gh api -X DELETE repos/o/r/git/refs/heads/gone
-          YML
-          ungranted noblock
+        run: ungranted noblock
 
       - name: an unreadable path is exit 2 and not exit 0
         # "Nobody looked" reported as a green tick is worse than no check.
         run: |
-          mkdir -p unknown/.github/workflows
-          cat > unknown/.github/workflows/ci.yml <<'YML'
-          name: ci
-          'on': push
-          permissions:
-            contents: read
-          jobs:
-            j:
-              runs-on: ubuntu-latest
-              steps:
-                - env: { GH_TOKEN: '${{ github.token }}' }
-                  run: gh api "$ENDPOINT"
-          YML
           code=0
           ungranted unknown || code=$?
+          ungranted unknown || true
           test "$code" -eq 2 || { echo "expected exit 2, got $code"; exit 1; }
 
       - name: it passes its own workflows
