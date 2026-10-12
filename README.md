@@ -133,9 +133,10 @@ so it is sound even though the reader is incomplete. An unused scope is a claim
 about calls that are *not* there, so anything unreadable in the job switches it
 off: an action not in the table, a `gh` subcommand not in the table, a reusable
 workflow, and above all a step that holds `GH_TOKEN` and runs a program of its
-own. `python3 scripts/thing.py` can call anything. Three of the four workflows
-in this organisation that have a `permissions:` block are exactly that shape,
-and the first version of this tool called all three of their grants unused.
+own. `python3 scripts/thing.py` can call anything. In the organisation this was
+written in, every job whose grant is actually load bearing is that shape — the
+API calls are inside a CLI the step runs — and the first version of this tool
+called all of their grants unused.
 
 For the same reason, scopes whose use is invisible in a workflow file —
 `packages`, `id-token`, `attestations`, `models`, `pages` — are never reported
