@@ -1,0 +1,67 @@
+# What a workflow token actually reached, measured on GitHub Actions rather
+# than read off a documentation page.
+#
+# Produced by pushing a workflow to a scratch branch of
+# committed-nightly/ungranted with one job per permissions: block, each job
+# running the same list of GET requests with the job's own GITHUB_TOKEN, and
+# reading the status codes back out of the run log. The repository was flipped
+# to private for the run, because on a public repository almost all of these
+# succeed with no token at all and the measurement says nothing (see the README
+# section "Public repositories hide this").
+#
+# Runs:
+#   https://github.com/committed-nightly/ungranted/actions/runs/38191167921
+#   https://github.com/committed-nightly/ungranted/actions/runs/38191167860
+#   https://github.com/committed-nightly/ungranted/actions/runs/38191403630
+#
+# A `-` means that block was not measured for that path. The empty-block job
+# of the first run could not run at all: on a private repository
+# actions/checkout needs contents: read, and under `permissions: {}` the clone
+# fails with "repository not found" before any step. The third run is the same
+# list with no checkout step, which is the only way to see a metadata-only
+# token, and it covers the paths where metadata was the open question.
+#
+# Columns are the HTTP status for a GET under each block. `metadata` is
+# `permissions: {}`, which the runner resolves to exactly `Metadata: read`.
+#
+# path	metadata	contents:read	contents+actions	read-all
+	200	200	200	200
+license	200	200	200	200
+languages	200	200	200	200
+topics	200	200	200	200
+tags	200	200	200	200
+forks	200	200	200	200
+events	200	200	200	200
+collaborators	200	200	200	200
+contributors	200	200	200	200
+comments	200	200	200	200
+readme	403	200	200	200
+contents/README.md	403	200	200	200
+commits	403	200	200	200
+compare/SHA...SHA	403	200	200	200
+branches	403	200	200	200
+git/ref/heads/main	403	200	200	200
+git/trees/SHA	403	200	200	200
+releases	403	200	200	200
+actions/workflows	-	403	200	200
+actions/runs	-	403	200	200
+actions/artifacts	-	403	200	200
+actions/caches	-	403	200	200
+environments	-	403	200	200
+pulls	403	403	403	200
+issues	-	403	403	200
+issues/comments	-	403	403	200
+labels	-	403	403	200
+milestones	-	403	403	200
+commits/SHA/check-runs	-	403	403	200
+commits/SHA/check-suites	-	403	403	200
+commits/SHA/statuses	-	403	403	200
+commits/SHA/status	-	403	403	200
+deployments	-	403	403	200
+pages	-	403	403	404
+dependabot/alerts	-	403	403	200
+actions/variables	-	403	403	403
+secret-scanning/alerts	-	403	403	403
+vulnerability-alerts	-	403	403	403
+hooks	-	403	403	403
+stargazers	403	403	403	403

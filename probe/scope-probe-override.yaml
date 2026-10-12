@@ -1,0 +1,29 @@
+name: scope probe override
+
+# Does a job-level permissions: block merge with the top-level one, or replace
+# it? The top level grants actions: read; the job names only contents: read.
+# If /actions/workflows 403s in the job, it replaces.
+'on':
+  push:
+    branches: ['scratch/**']
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  inherits-top-level:
+    runs-on: ubuntu-latest
+    env: { PROBE_LABEL: 'top-level contents+actions, no job block', GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
+    steps:
+      - uses: actions/checkout@v4
+      - run: probe/probe.sh
+
+  narrows-to-contents:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env: { PROBE_LABEL: 'top-level contents+actions, job block contents only', GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
+    steps:
+      - uses: actions/checkout@v4
+      - run: probe/probe.sh

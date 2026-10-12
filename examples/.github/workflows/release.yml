@@ -1,0 +1,91 @@
+name: release
+
+# Every job here is a real shape, and the first four are each wrong in a
+# different way. Nothing in this file is exaggerated for the example: the
+# grants are the ones people write and the calls are the ones people make.
+'on':
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  # The shape that cost logbook#41 a review round. The top-level block grants
+  # contents, the step calls /actions/workflows, and nothing says so until the
+  # run.
+  summarise:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: count the workflows
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh api "repos/$GITHUB_REPOSITORY/actions/workflows" --jq '.total_count'
+
+  # A job-level block that looks like it adds to the top-level one. It
+  # replaces it, so contents is gone and the checkout fails.
+  announce:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: open the release issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh issue create --title "Released $GITHUB_REF_NAME" --body "ship it"
+
+  # No -X anywhere, and it is a POST: gh switches method as soon as a field is
+  # given. Needs statuses: write, has statuses: none.
+  mark:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: flag the commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state=success -f context=release
+
+  # Granted for nothing. The job reads a release and nothing else.
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: look up the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name
+
+  # Right, and reported as right. The call is a write and the grant is a write.
+  comment:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              ...context.repo, issue_number: 1, body: 'released',
+            })
+
+  # Not governed by this block at all: a different secret, and a step with no
+  # token in scope. Neither is a permissions problem and neither is reported
+  # as one.
+  mirror:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: push to the mirror
+        env:
+          GH_TOKEN: ${{ secrets.MIRROR_PAT }}
+        run: gh api -X POST "repos/other/mirror/merge-upstream" -f branch=main
+      - name: forgot the token
+        run: gh api "repos/$GITHUB_REPOSITORY/pulls"
