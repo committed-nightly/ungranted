@@ -68,7 +68,7 @@ import re
 from dataclasses import dataclass, field
 
 from . import calls as callscan
-from .scopes import Need, UnknownPath, classify
+from .scopes import Need, UnknownPath, classify, split_path
 
 # What an expression this cannot evaluate becomes inside a string. Chosen to
 # match `scopes._is_dyn`, which already treats a `{` as an unresolved segment.
@@ -515,9 +515,21 @@ def _url_is_github(url: str) -> str | None:
     this way (`f"{api_base}/chat.postMessage"`), and the base is the only thing
     that tells them apart; it is not knowable here, so the shape of the rest is
     what decides. `chat.postMessage` matches no rule and is left alone.
+
+    A URL that does name a host is judged on the host, parsed -- not on
+    containing the string `api.github.com` somewhere. Both
+    `https://api.github.com.evil.test/repos/o/r/pulls` and
+    `https://evil.test/?x=api.github.com` contain it, and reading either as
+    GitHub would report a scope the workflow does not need. `split_path`
+    already rejects a host that is not GitHub's, so the test is delegated to it
+    rather than written a second time here.
     """
     text = url.strip()
-    if callscan._API_URL.search(text) or "api.github.com" in text:
+    if "//" in text.split("?", 1)[0]:
+        try:
+            split_path(text)  # raises unless the host is a GitHub API host
+        except UnknownPath:
+            return None
         return text
     head, _, rest = text.partition("/")
     if UNRESOLVED in head and rest:

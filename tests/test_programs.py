@@ -380,3 +380,34 @@ def test_a_file_that_will_not_parse_is_reported(tmp_path):
     assert program is not None
     assert not program.read
     assert "will not parse" in program.unreadable[0].reason
+
+
+def test_a_lookalike_host_is_not_read_as_github():
+    """A substring test for `api.github.com` passes on hosts that are not it.
+
+    CodeQL flagged the first version of this, which asked whether the string
+    appeared anywhere in the URL. Both of these contain it. Reading either as
+    GitHub would report a scope the workflow genuinely does not need, which is
+    the direction this tool must not fail in.
+    """
+    from ungranted.programs import _url_is_github
+
+    assert _url_is_github("https://api.github.com/repos/o/r/pulls")
+    assert _url_is_github("http://api.github.localhost/repos/o/r/pulls")
+    # GitHub Enterprise Server, which the scope table already understands.
+    assert _url_is_github("https://ghes.example.com/api/v3/repos/o/r/pulls")
+
+    assert _url_is_github("https://api.github.com.evil.test/repos/o/r/pulls") is None
+    assert _url_is_github("https://evil.test/api.github.com/repos/o/r/pulls") is None
+    assert _url_is_github("https://evil.test/?x=api.github.com") is None
+
+
+def test_a_request_to_a_lookalike_host_produces_no_needs():
+    out = scan(
+        """
+        import urllib.request
+        urllib.request.urlopen("https://api.github.com.evil.test/repos/o/r/releases")
+        """
+    )
+    assert out.calls == []
+    assert out.read
