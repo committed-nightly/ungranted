@@ -626,12 +626,21 @@ def scan_module(source: str, module: str, out: Program, wrappers: list[Wrapper])
         # 1. a direct subprocess argv naming gh
         argv = _subprocess_argv(call)
         if argv and _is_gh(_binary_name(argv[0], scope)):
+            enclosing = owner.get(id(call))
+            inside_wrapper = enclosing is not None and any(
+                w.where == f"{module}:{enclosing.lineno}" for w in wrappers
+            )
+            if inside_wrapper:
+                # This argv is the wrapper's own. Its endpoint is whatever its
+                # callers pass, so reading it here would report the parameter
+                # as an untraceable path and say nothing true. Tail wrappers
+                # are read at their call sites below; method wrappers are
+                # reported by read_program.
+                continue
             if any(isinstance(el, ast.Starred) for el in argv[1:]):
-                # Inside a wrapper: the paths are at its call sites, not here.
-                if not any(w.where.startswith(module) for w in wrappers):
-                    out.unreadable.append(
-                        ProgramUnreadable("a gh argv", where, "built from a list this cannot see")
-                    )
+                out.unreadable.append(
+                    ProgramUnreadable("a gh argv", where, "built from a list this cannot see")
+                )
                 continue
             _gh_call([render(el, scope) for el in argv[1:]], where, out)
             continue

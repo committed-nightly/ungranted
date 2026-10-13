@@ -14,6 +14,7 @@ from ungranted.core import (
     check,
 )
 from ungranted.grants import FROM_DEFAULT, FROM_JOB, FROM_WORKFLOW
+from ungranted.scopes import Need
 from ungranted.workflows import WorkflowError, parse
 
 TOKEN = "${{ secrets.GITHUB_TOKEN }}"
@@ -527,3 +528,99 @@ def test_a_typo_in_a_scope_name_is_not_read_as_a_grant():
         """
     )
     assert "bad-block" in kinds(report)
+
+
+# --------------------------------------------------------------------------
+# Reading the program a step runs. The job shape here is logbook's `org`
+# workflow, which is the case the whole feature exists for: a step holding
+# GITHUB_TOKEN runs a CLI in the same repository, and every API call the
+# grant exists for is inside that CLI.
+# --------------------------------------------------------------------------
+
+
+def repo_with(tmp_path, workflow: str, program: str, name: str = "ledger.py"):
+    (tmp_path / name).write_text(textwrap.dedent(program))
+    directory = tmp_path / ".github" / "workflows"
+    directory.mkdir(parents=True)
+    path = directory / "org.yaml"
+    path.write_text(textwrap.dedent(workflow))
+    return check([parse(path.read_text(), str(path))])
+
+
+LEDGER = """
+    import shutil, subprocess
+
+    def gh_json(args, gh="gh"):
+        exe = shutil.which(gh)
+        return subprocess.run([exe, *args], capture_output=True)
+
+    def workflows(org, name):
+        return gh_json(["api", f"repos/{org}/{name}/actions/workflows"])
+"""
+
+ORG_WORKFLOW = """
+    name: org
+    'on': {schedule: [{cron: '17 4 * * *'}]}
+    permissions:
+      contents: read
+    jobs:
+      org:
+        runs-on: ubuntu-latest
+        steps:
+          - env: {GH_TOKEN: "%s"}
+            run: ./ledger.py orphans
+""" % TOKEN
+
+
+def test_a_scope_a_program_needs_and_the_block_lacks_is_reported(tmp_path):
+    """logbook#41, which happened: org.yaml was short of actions: read for a
+    call inside ledger.py, and the 403 arrived on a scheduled run. Nothing
+    static could see it, because the path is not in the workflow file."""
+    report = repo_with(tmp_path, ORG_WORKFLOW, LEDGER)
+    missing = [f for f in report.findings if f.kind == MISSING]
+    assert [f.scope for f in missing] == ["actions"]
+    assert "ledger.py: gh api repos/{}/{}/actions/workflows" in missing[0].message
+
+
+def test_reading_the_program_stops_the_job_being_blind(tmp_path):
+    """Before this, the step was opaque: the job could not be checked and no
+    grant in it could be called unused. Now `contents: read` is granted,
+    nothing in the program reads contents, and that is sayable."""
+    report = repo_with(tmp_path, ORG_WORKFLOW, LEDGER)
+    job = report.jobs[0]
+    assert not job.blind
+    assert [f.scope for f in report.findings if f.kind == UNUSED] == ["contents"]
+
+
+def test_a_program_that_covers_its_grant_is_clean(tmp_path):
+    workflow = ORG_WORKFLOW.replace("contents: read", "actions: read")
+    report = repo_with(tmp_path, workflow, LEDGER)
+    assert report.findings == []
+    assert not report.jobs[0].blind
+    assert report.jobs[0].needs == [Need("actions", "read")]
+
+
+def test_a_command_that_resolves_to_nothing_leaves_the_job_blind(tmp_path):
+    """The behaviour this replaced, kept for everything that is not Python in
+    this repository -- `claude`, a compiled binary, a shell script."""
+    workflow = ORG_WORKFLOW.replace("./ledger.py orphans", "claude -p 'do the shift'")
+    report = repo_with(tmp_path, workflow, LEDGER)
+    job = report.jobs[0]
+    assert job.blind
+    assert [s.shown for s in job.skipped] == ["claude"]
+    # And so no unused finding, because nobody looked.
+    assert [f.kind for f in report.findings] == []
+
+
+def test_a_gap_inside_the_program_still_blinds_the_job(tmp_path):
+    """Partly read is not read. If the program has a call site this cannot
+    resolve, the job keeps its benefit of the doubt on unused scopes."""
+    program = LEDGER + """
+    def opaque(argv):
+        return gh_json(argv)
+"""
+    report = repo_with(tmp_path, ORG_WORKFLOW, program)
+    job = report.jobs[0]
+    assert job.blind
+    assert any("not a list written here" in s.shown for s in job.skipped)
+    assert [f.kind for f in report.findings if f.kind == UNUSED] == []
