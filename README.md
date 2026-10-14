@@ -177,8 +177,8 @@ a literal, and the table refuses rather than guess when the variable sits
 exactly where the answer would change. The imprecision is carried by the
 existing table instead of being invented by the reader.
 
-**It follows one wrapper.** The case this was built for has no path at the
-`subprocess` call at all:
+**It follows one wrapper, in either of its two shapes.** The case this was
+built for has no path at the `subprocess` call at all:
 
 ```python
 def gh_json(args, gh="gh"):
@@ -195,6 +195,26 @@ a second reads what their callers pass. A function is only believed to be a
 parameter whose default is `"gh"`, or a local assignment from one of those.
 Nothing is inferred from the function's name.
 
+The other shape passes only the endpoint, and the wrapper writes the rest of
+the argv itself:
+
+```python
+def gh_api(path, gh="gh"):
+    subprocess.run([gh, "api", "-H", ACCEPT, path])    # the argv, minus the path
+
+def workflow_states(org, repo):
+    return gh_api(f"repos/{org}/{repo}/actions/workflows")    # the path
+```
+
+The call site's argument is substituted into the wrapper's own argv at the slot
+it fills, and the whole line is then read as if it had been written at the call
+site. Keeping the real argv is what makes the method right: a wrapper whose
+argv says `-X POST`, or carries a `-f` field and no `-X` at all, is a write,
+and both reach the same parser that reads a `gh api` line out of a workflow
+file. Which parameter is the endpoint is decided by that parser too, rather
+than by a second copy of its flag rules — so `["api", "-H", header, path]`
+resolves to `path`, because `-H` eats the word after it.
+
 `urllib` requests are read too, including the method, which is where a real
 difference hides: a `Request` with a `data=` body and no `method=` anywhere is
 a `POST`, and that is `actions: write` rather than `actions: read`.
@@ -207,6 +227,17 @@ a `POST`, and that is `actions: write` rather than `actions: read`.
   between them would put dictionary keys in the scope table. The wrapper is
   reported as an unresolved entry point, so its job stays honestly blind rather
   than quietly clean.
+- **A wrapper nothing calls by name.** `ledger.gh_api(...)` through the module
+  is an attribute call and lands in the same blind spot as a method wrapper. A
+  wrapper whose call sites were never found is reported the same way, because
+  the alternative — no calls and nothing unreadable — is indistinguishable from
+  a program that touches no API at all.
+- **An endpoint behind a splat.** `gh_api(*argv)` hides which value reaches the
+  path, and `**kwargs` could carry it under any name. Reported, not guessed.
+- **Imports are not followed.** A loose script is read on its own and a script
+  in a package is read with its package; neither reads a module it imports from
+  elsewhere. An API call in an unfollowed sibling is currently invisible rather
+  than reported, which is tracked as `committed-nightly/logbook#45`.
 - **A URL on a variable base** is read as GitHub only if what follows the base
   is a path the scope table recognises. One real script builds both its GitHub
   and its Slack requests as `f"{api_base}/..."`, and the base is the only thing
