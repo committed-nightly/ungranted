@@ -1,0 +1,25 @@
+# A job whose grant is entirely load bearing and entirely unverifiable from
+# this file: the step runs `./ledger.py`, and every API call the three scopes
+# exist for is inside it. `actions: read` is missing, which is the bug that
+# happened for real in committed-nightly/logbook#41 and arrived as a 403 on a
+# scheduled run rather than in review.
+name: org
+
+'on':
+  schedule:
+    - cron: '17 4 * * *'
+
+permissions:
+  contents: read      # contents/ — reading workflow files
+  pull-requests: read # pulls/ — the newest-PR lookup
+
+jobs:
+  org:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: every repo in the org is accounted for
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./ledger.py committed-nightly

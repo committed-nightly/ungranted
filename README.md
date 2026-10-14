@@ -143,13 +143,131 @@ For the same reason, scopes whose use is invisible in a workflow file —
 as unused. A `docker push ghcr.io/...` is detected; a library three
 repositories away asking for an OIDC token is not.
 
-**The call has to be in the workflow file.** This is the real limit, and it is
-worth being blunt about: the review round that prompted this tool was a
-`permissions:` block that did not cover an API call made *inside* a
-repository's own script, and `ungranted` cannot see into that script either.
-What it does instead is name the step and say it could not check it, which
-points at where to look, and `--strict` turns that into an answer rather than a
-silence.
+**A program it cannot resolve is still a wall.** It reads Python source in the
+repository being checked (below). Anything else — a compiled binary, a shell
+script, `node build.js`, `claude -p` — is named and skipped, and `--strict`
+turns that into an answer rather than a silence.
+
+## Reading the program a step runs
+
+The jobs whose `permissions:` block is actually load bearing mostly do not make
+their API calls in the workflow file. A step holds `GITHUB_TOKEN`, runs a CLI
+from the same repository, and every call the grant exists for is inside that
+program. For those, naming the step and giving up is not a check.
+
+So when a step holds the workflow's own token and runs a command that resolves
+to Python source in the repository, that source is read and its API calls are
+folded in as though they had been written in the workflow file — which is what
+they are. Three spellings of the command are resolved: a script named directly
+(`./ledger.py`), a script handed to an interpreter (`python3 scripts/x.py`),
+and an installed console script (`greenwash`), which is looked up through
+`pyproject.toml` because the entry point does not exist as a file in a
+checkout.
+
+It reads the source; it does not run it. So the question answered is "which API
+paths are in this program", not "which did this run reach" — a call behind a
+branch nobody took is still reported, which is the safe direction for a
+permissions question. A grant you need on one code path is a grant you need.
+
+**Substitutions become `{}`.** An f-string's values are unknowable statically,
+so `f"repos/{org}/{name}/pulls"` reads as `repos/{}/{}/pulls`. That is the same
+answer the tool already gives for `${{ }}` in a workflow file, and the scope
+table already treats such a segment as unresolved: it matches a wildcard, never
+a literal, and the table refuses rather than guess when the variable sits
+exactly where the answer would change. The imprecision is carried by the
+existing table instead of being invented by the reader.
+
+**It follows one wrapper, in either of its two shapes.** The case this was
+built for has no path at the `subprocess` call at all:
+
+```python
+def gh_json(args, gh="gh"):
+    exe = shutil.which(gh)
+    return subprocess.run([exe, *args], capture_output=True)   # no path here
+
+def workflow_states(org, repo, gh="gh"):
+    return gh_json(["api", f"repos/{org}/{repo}/actions/workflows"])   # here
+```
+
+A first pass finds functions that put one of their parameters into a `gh` argv;
+a second reads what their callers pass. A function is only believed to be a
+`gh` wrapper if the head of the argv traces to the string `"gh"` — a literal, a
+parameter whose default is `"gh"`, or a local assignment from one of those.
+Nothing is inferred from the function's name.
+
+The other shape passes only the endpoint, and the wrapper writes the rest of
+the argv itself:
+
+```python
+def gh_api(path, gh="gh"):
+    subprocess.run([gh, "api", "-H", ACCEPT, path])    # the argv, minus the path
+
+def workflow_states(org, repo):
+    return gh_api(f"repos/{org}/{repo}/actions/workflows")    # the path
+```
+
+The call site's argument is substituted into the wrapper's own argv at the slot
+it fills, and the whole line is then read as if it had been written at the call
+site. Keeping the real argv is what makes the method right: a wrapper whose
+argv says `-X POST`, or carries a `-f` field and no `-X` at all, is a write,
+and both reach the same parser that reads a `gh api` line out of a workflow
+file. Which parameter is the endpoint is decided by that parser too, rather
+than by a second copy of its flag rules — so `["api", "-H", header, path]`
+resolves to `path`, because `-H` eats the word after it.
+
+`urllib` requests are read too, including the method, which is where a real
+difference hides: a `Request` with a `data=` body and no `method=` anywhere is
+a `POST`, and that is `actions: write` rather than `actions: read`.
+
+### What it will not resolve
+
+- **Method wrappers.** A `def get(self, path)` that builds a `gh api` argv is
+  found and named, but `transport.get(...)` and `body.get("message")` are
+  spelled identically and the receiver's class is not known here. Guessing
+  between them would put dictionary keys in the scope table. The wrapper is
+  reported as an unresolved entry point, so its job stays honestly blind rather
+  than quietly clean.
+- **A wrapper nothing calls by name.** `ledger.gh_api(...)` through the module
+  is an attribute call and lands in the same blind spot as a method wrapper. A
+  wrapper whose call sites were never found is reported the same way, because
+  the alternative — no calls and nothing unreadable — is indistinguishable from
+  a program that touches no API at all.
+- **An endpoint behind a splat.** `gh_api(*argv)` hides which value reaches the
+  path, and `**kwargs` could carry it under any name. Reported, not guessed.
+- **Imports are not followed.** A loose script is read on its own and a script
+  in a package is read with its package; neither reads a module it imports from
+  elsewhere. An API call in an unfollowed sibling is currently invisible rather
+  than reported, which is tracked as `committed-nightly/logbook#45`.
+- **A URL on a variable base** is read as GitHub only if what follows the base
+  is a path the scope table recognises. One real script builds both its GitHub
+  and its Slack requests as `f"{api_base}/..."`, and the base is the only thing
+  that distinguishes them. `chat.postMessage` matches no rule and is left
+  alone.
+- **A name assigned twice** is not traced. Two assignments have two answers and
+  taking the later one is not a fact about anything.
+- **Partly read is not read.** If any call site in the program cannot be
+  resolved, the job keeps its benefit of the doubt and no grant in it is
+  reported as unused — the same rule as for an unrecognised action.
+
+`examples/program` is a repository of this shape, and the bug in it is the one
+that actually happened in `committed-nightly/logbook#41` — a block short of
+`actions: read` for a call inside the repository's own CLI, which arrived as a
+403 on a scheduled run because nothing static could see it:
+
+```
+$ ungranted examples/program
+.github/workflows/org.yaml
+  org
+    grant  contents: read, pull-requests: read (workflow)
+    ungranted          ledger.py: gh api repos/{}/{}/actions/workflows needs actions: read; this job has actions: none
+                       in step: every repo in the org is accounted for
+
+1 finding in 1 of 1 job.
+```
+
+The endpoint is not in the workflow file, and it is not a literal in
+`ledger.py` either — it is `f"repos/{org}/{repo}/actions/workflows"`, four
+functions away from the `subprocess.run` that issues it.
 
 ## How the scope table was built
 
@@ -216,6 +334,10 @@ nothing at all, which is why this section exists.
   reading that properly is a second tool.
 - **No reusable workflows.** A `uses:` job is named and skipped, not followed
   into the other file.
+- **Only Python programs are read.** A step that runs a shell script, a Go
+  binary or `node` is named and skipped. Python is what the organisation this
+  was written in actually runs; nothing about the approach is specific to it,
+  and nothing else is implemented.
 - **It does not run anything against your repository.** The table is a record
   of a measurement taken once, not a live probe.
 

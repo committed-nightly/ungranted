@@ -365,6 +365,17 @@ def classify(raw: str, method: str = "GET") -> Need:
         rest = segments[1:]
         if len(rest) >= 2 and rest[1] == "packages":
             return Need("packages", level)
+        if len(rest) == 1 and level == READ:
+            # `GET /orgs/{org}` is organisation metadata. Measured, because the
+            # first version of this table said organisation administration --
+            # which is in UNGRANTABLE, so it told anybody making this very
+            # ordinary call that no permissions: block could help them and they
+            # needed a different token. In probe run 38191167921 it answered
+            # 200 under `permissions: actions: read` and under `contents:
+            # read`. A block replaces the default grant, and the only scope
+            # besides the named one that a block cannot remove is metadata, so
+            # 200 there means metadata was enough.
+            return Need(METADATA, READ)
         return Need("organization-administration", level)
     if head == "graphql":
         raise UnknownPath(

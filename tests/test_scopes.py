@@ -113,3 +113,30 @@ def test_the_settable_list_matches_actionlint():
     }
     assert set(SETTABLE) == actionlint
     assert METADATA not in SETTABLE  # implicit, and GitHub rejects the key
+
+
+def test_reading_an_organisation_is_metadata_not_organisation_administration():
+    """Measured, because the first version of this table got it backwards.
+
+    `organization-administration` is in UNGRANTABLE, so classifying
+    `GET /orgs/{org}` as needing it told anybody making this very ordinary
+    call that no `permissions:` block could help and they needed a different
+    token. `committed-nightly/logbook` makes exactly this call from a
+    scheduled workflow and it has worked every day.
+
+    The measurement is probe run 38191167921, where `orgs/committed-nightly`
+    answered 200 under `permissions: actions: read` and again under
+    `permissions: contents: read`. A block replaces the default grant rather
+    than extending it, and metadata is the only scope a block cannot remove,
+    so a 200 under a block that names an unrelated scope means metadata was
+    sufficient.
+    """
+    assert classify("orgs/committed-nightly", "GET").scope == METADATA
+    assert classify("https://api.github.com/orgs/x", "GET").scope == METADATA
+
+    # Still not a licence for the rest of the org API. Changing the
+    # organisation, and its sub-resources, were not measured and stay as they
+    # were -- the fix is to one path, not to a family.
+    assert classify("orgs/x", "PATCH").scope == "organization-administration"
+    assert classify("orgs/x/members", "GET").scope == "organization-administration"
+    assert classify("orgs/x/packages", "GET").scope == "packages"

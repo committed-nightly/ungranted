@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 
 from . import actions as action_table
 from . import calls as callscan
+from . import programs
 from .calls import TOKEN_NONE, TOKEN_OTHER, TOKEN_WORKFLOW, Call
 from .grants import FROM_DEFAULT, Grant, GrantError, effective, unknown_keys
 from .scopes import (
@@ -151,12 +152,17 @@ def _token_from_env(env: dict[str, str], names: tuple[str, ...]) -> tuple[str, s
 
 def _calls_in_run(
     script: str, env: dict[str, str]
-) -> tuple[list[Call], list[callscan.Unreadable], list[str]]:
-    """(calls, unreadable constructs, commands that could call the API unseen)."""
+) -> tuple[list[Call], list[callscan.Unreadable], list[list[str]]]:
+    """(calls, unreadable constructs, commands that could call the API unseen).
+
+    The opaque commands come back whole rather than as bare program names,
+    because `programs.py` needs the arguments to find the file: `python3
+    scripts/x.py` is only resolvable if `scripts/x.py` survives.
+    """
     masked, mapping = callscan.mask_expressions(script)
     found: list[Call] = []
     unreadable: list[callscan.Unreadable] = []
-    opaque: list[str] = []
+    opaque: list[list[str]] = []
 
     gh_token, gh_var = _token_from_env(env, callscan.GH_TOKEN_VARS)
 
@@ -228,7 +234,7 @@ def _calls_in_run(
             )
             continue
         if not accounted and argv0 not in INERT:
-            opaque.append(argv0)
+            opaque.append([callscan.unmask(t, mapping) for t in tokens])
 
     for need in action_table.shell_extras(masked):
         registry = need.scope == "packages"
@@ -240,7 +246,7 @@ def _calls_in_run(
                 needs=(need,),
             )
         )
-    return found, unreadable, sorted(set(opaque))
+    return found, unreadable, opaque
 
 
 def _curl_token(
@@ -354,23 +360,49 @@ def check_job(workflow: Workflow, job: Job) -> JobReport:
             # whole purpose is a CLI that reads the Actions API.
             token_kind, _ = _token_from_env(env, callscan.GH_TOKEN_VARS)
             if opaque and token_kind == TOKEN_WORKFLOW:
-                report.blind = True
-                report.skipped.append(
-                    Skipped(
-                        workflow.path,
-                        job.name,
-                        step.label,
-                        ", ".join(opaque),
-                        "runs with the workflow token and may call the API itself, "
-                        "so no grant in this job is reported as unused",
+                # Before giving up on the step, try to read the programs it
+                # runs. A command that resolves to Python source in this
+                # repository stops being opaque: its API calls are folded in
+                # here as if they had been written in the workflow file, which
+                # is what they are.
+                root = programs.repo_root(workflow.path)
+                still_opaque: list[str] = []
+                for command in opaque:
+                    program = programs.read_program(command, root) if root else None
+                    if program is None:
+                        still_opaque.append(command[0].rsplit("/", 1)[-1])
+                        continue
+                    for pcall in program.calls:
+                        found.append(
+                            Call(
+                                kind="program",
+                                shown=f"{program.entry}: {pcall.shown}",
+                                token=TOKEN_WORKFLOW,
+                                needs=pcall.needs,
+                            )
+                        )
+                    for gap in program.unreadable:
+                        unreadable.append(f"{gap.where}: {gap.shown}: {gap.reason}")
+                if still_opaque:
+                    report.blind = True
+                    report.skipped.append(
+                        Skipped(
+                            workflow.path,
+                            job.name,
+                            step.label,
+                            ", ".join(sorted(set(still_opaque))),
+                            "runs with the workflow token and may call the API itself, "
+                            "so no grant in this job is reported as unused",
+                        )
                     )
-                )
         if step.uses:
             uses_calls, uses_unreadable = _calls_in_uses(step, env)
             found.extend(uses_calls)
             unreadable.extend(uses_unreadable)
 
-        for note in unreadable:
+        # Deduplicated: a step that runs the same program twice, or two
+        # programs from one package, otherwise reports the same gap twice.
+        for note in dict.fromkeys(unreadable):
             report.blind = True
             report.skipped.append(
                 Skipped(workflow.path, job.name, step.label, note, "not read")

@@ -152,6 +152,25 @@ jobs:
           ungranted unknown || true
           test "$code" -eq 2 || { echo "expected exit 2, got $code"; exit 1; }
 
+      - name: the program a step runs is read, and the README's example holds
+        # The section "Reading the program a step runs" rests on this exact
+        # output. The endpoint is an f-string four functions from the
+        # subprocess call, so if the reader stops following wrappers this goes
+        # quiet rather than wrong -- which is why the finding is asserted by
+        # name and the exit code asserted as 1 and not 0.
+        run: |
+          code=0
+          ungranted examples/program > program.txt || code=$?
+          cat program.txt
+          test "$code" -eq 1 || { echo "expected exit 1, got $code"; exit 1; }
+          grep -q 'ledger.py: gh api repos/{}/{}/actions/workflows needs actions: read' program.txt
+          grep -qx '1 finding in 1 of 1 job.' program.txt
+          # Read, therefore not blind: the two scopes the program does use are
+          # not reported as unused, and nothing is skipped for being opaque.
+          if grep -q 'may call the API itself' program.txt; then
+            echo "the step was still opaque; the program was not read"; exit 1
+          fi
+
       - name: it passes its own workflows
         # This file. Every job here declares a block, so there is no excuse.
         run: ungranted . --strict
