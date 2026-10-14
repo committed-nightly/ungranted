@@ -230,6 +230,200 @@ def test_a_wrappers_own_argv_is_not_read_as_a_call_site():
 
 
 # --------------------------------------------------------------------------
+# wrappers: the other shape, where the caller passes only the endpoint
+# --------------------------------------------------------------------------
+
+# The splat shape above is the one `ledger.py` happens to use. This one is at
+# least as common, and it failed the other way: the call site matched no branch
+# of the module scan at all, so the program came back with no calls and nothing
+# unreadable -- which is what a program that touches no API looks like.
+PATH_SHAPE = """
+import subprocess
+
+def gh_api(path, gh="gh"):
+    subprocess.run([gh, "api", path])
+
+def check_workflows(org, repo):
+    gh_api(f"repos/{org}/{repo}/actions/workflows")
+"""
+
+
+def test_a_path_wrapper_has_its_call_sites_read():
+    out = scan(PATH_SHAPE)
+    assert shown(out) == ["gh api repos/{}/{}/actions/workflows"]
+    assert needs(out) == [("actions", "read")]
+    assert out.read
+
+
+def test_a_path_wrapper_with_no_call_sites_is_not_silent():
+    """The regression that matters. An unresolved call site must never leave
+    `calls` and `unreadable` both empty, because `core.py` reads that as a
+    program making no API calls and will call a real grant unused."""
+    out = scan(
+        """
+        import subprocess
+        def gh_api(path, gh="gh"):
+            subprocess.run([gh, "api", path])
+        """
+    )
+    assert out.calls == []
+    assert out.unreadable == []  # the module scan cannot know; read_program can
+
+
+def test_a_wrapper_nothing_calls_by_name_is_reported(tmp_path):
+    """`ledger.gh_api(...)` is an attribute call and is not attributed, so the
+    wrapper is reported rather than left out -- the same rule as a method
+    wrapper, for the same reason."""
+    (tmp_path / "t.py").write_text(
+        textwrap.dedent(
+            """
+            import subprocess
+            def gh_api(path, gh="gh"):
+                subprocess.run([gh, "api", path])
+            """
+        )
+    )
+    out = read_program(["./t.py"], str(tmp_path))
+    assert out is not None and not out.read
+    assert out.unreadable[0].shown == "gh_api()"
+    assert "nothing calls it by that name" in out.unreadable[0].reason
+
+
+def test_a_resolved_path_wrapper_leaves_nothing_unreadable(tmp_path):
+    """The other half of the rule above: a wrapper whose call sites *were*
+    read must not then be reported for not having been."""
+    (tmp_path / "t.py").write_text(textwrap.dedent(PATH_SHAPE))
+    out = read_program(["./t.py"], str(tmp_path))
+    assert out is not None and out.read
+    assert needs(out) == [("actions", "read")]
+
+
+def test_the_endpoint_is_not_confused_with_a_flags_value():
+    """`["api", "-H", header, path]`. Picking the first parameter after `api`
+    that does not start with `-` picks `header`, whose default is a literal
+    Accept string -- so the real path never reaches the table. Which word is
+    the endpoint is decided by gh's own argument parser instead."""
+    out = scan(
+        """
+        import subprocess
+        def gh_api(path, header="Accept: application/vnd.github+json", gh="gh"):
+            subprocess.run([gh, "api", "-H", header, path])
+        def go(org, repo):
+            gh_api(f"repos/{org}/{repo}/actions/workflows")
+        """
+    )
+    assert shown(out) == ["gh api repos/{}/{}/actions/workflows"]
+    assert needs(out) == [("actions", "read")]
+
+
+def test_the_wrappers_own_write_flags_reach_the_call_site():
+    """The wrapper holds the `-X`, the call site holds only the path. Reading
+    the path alone would report this as a read."""
+    out = scan(
+        """
+        import subprocess
+        def gh_post(path, gh="gh"):
+            subprocess.run([gh, "api", "-X", "POST", path])
+        def go(org, repo):
+            gh_post(f"repos/{org}/{repo}/issues")
+        """
+    )
+    assert needs(out) == [("issues", "write")]
+
+
+def test_a_body_field_in_the_wrapper_makes_it_a_write_with_no_dash_x():
+    """gh's own rule, and the reason the wrapper's real argv is kept rather
+    than a method re-derived from it: `gh api X -f a=b` is a POST."""
+    out = scan(
+        """
+        import subprocess
+        def gh_field(path, gh="gh"):
+            subprocess.run([gh, "api", path, "-f", "body=hi"])
+        def go(org, repo):
+            gh_field(f"repos/{org}/{repo}/issues")
+        """
+    )
+    assert needs(out) == [("issues", "write")]
+
+
+def test_a_path_passed_by_keyword_is_bound():
+    out = scan(
+        """
+        import subprocess
+        def gh_api(gh="gh", path=None):
+            subprocess.run([gh, "api", path])
+        def go(org):
+            gh_api(path=f"orgs/{org}/members")
+        """
+    )
+    assert shown(out) == ["gh api orgs/{}/members"]
+
+
+def test_an_endpoint_behind_a_splat_is_reported_not_guessed():
+    """`*args` shifts every position after it, so binding by index would be a
+    guess, and a guess here puts something that is not a path in the table."""
+    out = scan(
+        """
+        import subprocess
+        def gh_api(path, gh="gh"):
+            subprocess.run([gh, "api", path])
+        def go(argv):
+            gh_api(*argv)
+        """
+    )
+    assert out.calls == []
+    assert not out.read
+    assert "behind a splat" in out.unreadable[0].reason
+
+
+def test_an_endpoint_behind_kwargs_is_reported_not_guessed():
+    out = scan(
+        """
+        import subprocess
+        def gh_api(path, gh="gh"):
+            subprocess.run([gh, "api", path])
+        def go(opts):
+            gh_api(**opts)
+        """
+    )
+    assert not out.read
+    assert "behind a splat" in out.unreadable[0].reason
+
+
+def test_a_call_site_that_passes_nothing_falls_back_to_the_default():
+    """Not a guess: the default is already rendered into the wrapper's argv,
+    and leaving it there is what Python does."""
+    out = scan(
+        """
+        import subprocess
+        def gh_api(path="repos/o/r/actions/runs", gh="gh"):
+            subprocess.run([gh, "api", path])
+        def go():
+            gh_api()
+        """
+    )
+    assert shown(out) == ["gh api repos/o/r/actions/runs"]
+    assert needs(out) == [("actions", "read")]
+
+
+def test_a_defaultless_endpoint_left_unpassed_is_reported():
+    """No argument and no default: the endpoint renders as `{}` and the call
+    is reported as untraceable rather than recorded against a wildcard."""
+    out = scan(
+        """
+        import subprocess
+        def gh_api(path, gh="gh"):
+            subprocess.run([gh, "api", path])
+        def go():
+            gh_api()
+        """
+    )
+    assert out.calls == []
+    assert not out.read
+    assert "could not trace" in out.unreadable[0].reason
+
+
+# --------------------------------------------------------------------------
 # urllib
 # --------------------------------------------------------------------------
 

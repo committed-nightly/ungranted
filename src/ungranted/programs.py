@@ -20,6 +20,7 @@ programs use, and in that order of directness:
 
     subprocess.run([gh, "api", f"repos/{org}/{name}/pulls"])     a direct argv
     gh_json(["api", f"orgs/{org}"])                              via a wrapper
+    gh_api(f"orgs/{org}")                                        ditto, path only
     urllib.request.Request(f"{base}/repos/{r}/actions/runs/{i}/rerun", data=...)
 
 The wrapper case is the one that matters. `ledger.py` has one function that
@@ -27,6 +28,13 @@ every API call in the file goes through, and the `subprocess.run` inside it
 names no path at all -- the paths are at the nine call sites. So a first pass
 finds functions that pass a parameter into a `gh` argv, and a second pass reads
 the arguments their callers supply.
+
+Wrappers come in both shapes and both are resolved. `gh_json(args)` splats a
+whole gh command line; `gh_api(path)` supplies only the endpoint of an argv the
+wrapper already wrote. The second is at least as common as the first and it is
+the one a reader of this file is most likely to assume is handled, so the
+second pass substitutes the call site's argument into the wrapper's own argv
+and reads the result as if it had been written at the call site.
 
 A wrapper is only believed to be a `gh` wrapper if the head of the argv can be
 traced to the string "gh": a literal, a parameter whose default is `"gh"`, or a
@@ -58,6 +66,12 @@ known here, and `body.get("message")` is spelled identically. Guessing between
 them would put dictionary keys into the scope table. The wrapper is reported as
 an unresolved entry point instead, which keeps its job honest rather than
 silently clean.
+
+The same applies to any wrapper whose call sites were not found at all --
+`ledger.gh_api(...)` through the module is an attribute call and lands in that
+same blind spot. A wrapper that was never called by name is reported rather
+than left out, because the alternative is a `Program` with no calls and nothing
+unreadable, which is exactly what a program that touches no API looks like.
 """
 
 from __future__ import annotations
@@ -382,13 +396,24 @@ class Wrapper:
     caller's list is the whole gh command line. `path` is a parameter sitting in
     the endpoint position of an argv that already says `api`, so a caller's
     argument is just the path.
+
+    A path wrapper carries the argv it was found in: `argv` is that argv as
+    rendered here, minus the binary, and `path_index` is the slot a caller's
+    argument fills. Keeping the real argv rather than a re-derived method means
+    the wrapper's own `-X`, `-f` and `-H` flags still reach `parse_gh_api`,
+    which is the thing that knows `gh api X -f a=b` is a POST.
+
+    `positional` is the parameter names in order, which is what lets a call
+    site's positional arguments be bound to the one that is the endpoint.
     """
 
     name: str
     qualname: str
     tail: str | None = None
     path: str | None = None
-    method: str = "GET"
+    argv: tuple[str, ...] = ()
+    path_index: int | None = None
+    positional: tuple[str, ...] = ()
     is_method: bool = False
     where: str = ""
 
@@ -408,12 +433,32 @@ def _subprocess_argv(call: ast.Call) -> list[ast.expr] | None:
     return _argv_elements(call.args[0])
 
 
-def _gh_api_method(words: list[str]) -> str:
-    """`-X POST` out of a rendered gh argv."""
-    for i, word in enumerate(words):
-        if word in ("-X", "--method") and i + 1 < len(words):
-            return words[i + 1].upper()
-    return "GET"
+# Stood in for a parameter to ask `parse_gh_api` whether that parameter is the
+# endpoint. Deliberately not a plausible path or flag: no leading `-`, no `=`,
+# and a NUL, so it cannot collide with anything rendered out of real source.
+_PATH_PROBE = "\x00endpoint\x00"
+
+
+def _endpoint_parameter(
+    elements: list[ast.expr], words: list[str], params: set[str]
+) -> tuple[str, int] | None:
+    """Which parameter of a `gh api` argv is the endpoint, and where it sits.
+
+    Asks gh's own argument parser instead of keeping a second copy of its flag
+    rules: put a sentinel where the parameter is and see whether it comes back
+    as the path. `["api", "-H", header, path]` therefore resolves to `path`,
+    because `parse_gh_api` knows `-H` eats the word after it -- a hand-rolled
+    "first parameter after `api` that does not start with `-`" picks `header`,
+    and a header is not an endpoint.
+    """
+    for index, element in enumerate(elements):
+        if not (isinstance(element, ast.Name) and element.id in params):
+            continue
+        probe = list(words)
+        probe[index] = _PATH_PROBE
+        if callscan.parse_gh_api(["gh"] + probe)[0] == _PATH_PROBE:
+            return element.id, index
+    return None
 
 
 def find_wrappers(tree: ast.Module, module: str) -> list[Wrapper]:
@@ -426,10 +471,10 @@ def find_wrappers(tree: ast.Module, module: str) -> list[Wrapper]:
             continue
         parent_class = _enclosing_class(tree, node)
         scope = _Scope(node, parent=_class_scope(parent_class, module_scope))
-        params = {
-            arg.arg
-            for arg in list(node.args.posonlyargs) + list(node.args.args) + list(node.args.kwonlyargs)
-        }
+        positional = tuple(
+            arg.arg for arg in list(node.args.posonlyargs) + list(node.args.args)
+        )
+        params = set(positional) | {arg.arg for arg in node.args.kwonlyargs}
         for call in ast.walk(node):
             if not isinstance(call, ast.Call):
                 continue
@@ -453,7 +498,7 @@ def find_wrappers(tree: ast.Module, module: str) -> list[Wrapper]:
             )
             if splat:
                 found.append(
-                    Wrapper(node.name, qualname, tail=splat,
+                    Wrapper(node.name, qualname, tail=splat, positional=positional,
                             is_method=parent_class is not None, where=where)
                 )
                 continue
@@ -462,16 +507,12 @@ def find_wrappers(tree: ast.Module, module: str) -> list[Wrapper]:
             words = [render(el, scope) for el in plain]
             if "api" not in words:
                 continue
-            # The endpoint is the first parameter named after `api`, skipping
-            # the flags and the values they consume -- `["api", "-H", h, path]`.
-            endpoint = None
-            for el, word in list(zip(plain, words))[words.index("api") + 1 :]:
-                if isinstance(el, ast.Name) and el.id in params and not word.startswith("-"):
-                    endpoint = el.id
-                    break
+            endpoint = _endpoint_parameter(plain, words, params)
             if endpoint:
+                name, index = endpoint
                 found.append(
-                    Wrapper(node.name, qualname, path=endpoint, method=_gh_api_method(words),
+                    Wrapper(node.name, qualname, path=name, argv=tuple(words), path_index=index,
+                            positional=positional,
                             is_method=parent_class is not None, where=where)
                 )
     return found
@@ -604,8 +645,49 @@ def _gh_call(words: list[str], where: str, out: Program) -> None:
         out.calls.append(ProgramCall(shown, where, tuple(needs)))
 
 
-def scan_module(source: str, module: str, out: Program, wrappers: list[Wrapper]) -> None:
-    """Read one module's API calls into `out`."""
+# The call site passes the parameter, but behind a splat that could put it
+# anywhere. Distinct from None, which means the parameter was simply not passed.
+_UNBINDABLE = object()
+
+
+def _supplied_argument(call: ast.Call, wrapper: Wrapper, name: str) -> object:
+    """What a call site passes for one of the wrapper's parameters.
+
+    The expression itself; or None when the call site leaves the parameter to
+    its default, which needs no substitution because the default is already
+    rendered into `wrapper.argv`. `_UNBINDABLE` when the call site's shape
+    hides the answer: a `**kwargs` could carry the parameter under any name,
+    and a `*args` shifts every position after it, so binding by index would be
+    a guess -- and a guess here puts a string that is not a path into the scope
+    table.
+    """
+    for keyword in call.keywords:
+        if keyword.arg == name:
+            return keyword.value
+        if keyword.arg is None:
+            return _UNBINDABLE
+    if name not in wrapper.positional:
+        return None  # keyword-only and not given by keyword: its default stands
+    index = wrapper.positional.index(name)
+    splat = next((i for i, arg in enumerate(call.args) if isinstance(arg, ast.Starred)), None)
+    if splat is not None and index >= splat:
+        return _UNBINDABLE
+    return call.args[index] if index < len(call.args) else None
+
+
+def scan_module(
+    source: str,
+    module: str,
+    out: Program,
+    wrappers: list[Wrapper],
+    resolved: set[str] | None = None,
+) -> None:
+    """Read one module's API calls into `out`.
+
+    `resolved` collects the `where` of every wrapper this module called, so
+    `read_program` can tell a wrapper whose endpoints were read from one whose
+    call sites it never found.
+    """
     try:
         tree = ast.parse(source)
     except SyntaxError as exc:
@@ -645,8 +727,9 @@ def scan_module(source: str, module: str, out: Program, wrappers: list[Wrapper])
             if inside_wrapper:
                 # This argv is the wrapper's own. Its endpoint is whatever its
                 # callers pass, so reading it here would report the parameter
-                # as an untraceable path and say nothing true. Tail wrappers
-                # are read at their call sites below; method wrappers are
+                # as an untraceable path and say nothing true. Tail and path
+                # wrappers are read at their call sites below; method wrappers,
+                # and any wrapper whose call sites were never found, are
                 # reported by read_program.
                 continue
             if any(isinstance(el, ast.Starred) for el in argv[1:]):
@@ -660,6 +743,8 @@ def scan_module(source: str, module: str, out: Program, wrappers: list[Wrapper])
         # 2. a call to a wrapper found in pass one
         wrapper = by_name.get(plain_name or "")
         if wrapper and wrapper.tail and not wrapper.is_method:
+            if resolved is not None:
+                resolved.add(wrapper.where)
             if not call.args:
                 continue
             elements = _argv_elements(call.args[0])
@@ -679,6 +764,28 @@ def scan_module(source: str, module: str, out: Program, wrappers: list[Wrapper])
                 )
                 continue
             _gh_call([render(el, scope) for el in elements], where, out)
+            continue
+
+        # 2b. a call to a path wrapper: the argument is the endpoint on its
+        # own, so it goes into the wrapper's own argv at the slot it fills and
+        # the whole line is read as if it had been written here.
+        if wrapper and wrapper.path_index is not None and not wrapper.is_method:
+            if resolved is not None:
+                resolved.add(wrapper.where)
+            supplied = _supplied_argument(call, wrapper, wrapper.path or "")
+            if supplied is _UNBINDABLE:
+                out.unreadable.append(
+                    ProgramUnreadable(
+                        f"{wrapper.name}(...)", where,
+                        f"its {wrapper.path} argument is behind a splat, so which "
+                        "value reaches the endpoint is not knowable here",
+                    )
+                )
+                continue
+            words = list(wrapper.argv)
+            if isinstance(supplied, ast.expr):
+                words[wrapper.path_index] = render(supplied, scope)
+            _gh_call(words, where, out)
             continue
 
         # 3. urllib / requests
@@ -746,8 +853,9 @@ def read_program(tokens: list[str], root: str) -> Program | None:
     for name, tree in trees:
         wrappers.extend(find_wrappers(tree, name))
 
+    resolved: set[str] = set()
     for name, source in sources:
-        scan_module(source, name, out, wrappers)
+        scan_module(source, name, out, wrappers, resolved)
 
     for wrapper in wrappers:
         if wrapper.is_method:
@@ -757,6 +865,21 @@ def read_program(tokens: list[str], root: str) -> Program | None:
                     wrapper.where,
                     "builds a gh api call from an argument; its callers are attribute "
                     "calls this does not attribute to it",
+                )
+            )
+        elif wrapper.where not in resolved:
+            # Its endpoints are at call sites and no call site was found, so
+            # the paths it requests were never read. The usual cause is a call
+            # through the module (`ledger.gh_api(...)`), which is an attribute
+            # call and lands in the same blind spot as a method wrapper. Either
+            # way this must not be silent: a program with no calls and nothing
+            # unreadable reads as a program that calls no API at all.
+            out.unreadable.append(
+                ProgramUnreadable(
+                    f"{wrapper.qualname}()",
+                    wrapper.where,
+                    "builds a gh api call from an argument and nothing calls it by "
+                    "that name here, so the endpoints it is given were never read",
                 )
             )
     return out
