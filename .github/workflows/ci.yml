@@ -92,22 +92,7 @@ jobs:
           grep -q 'contents: write is granted and every call here only reads' out.txt
           grep -qx '    covered' out.txt
 
-      - name: the two calls this must not report are not reported
-        # A different secret and a missing token are both false positives if
-        # they turn up as findings. This is the assertion that keeps them out.
-        run: |
-          ungranted examples -q > findings.txt || test $? -le 1
-          cat findings.txt
-          if grep -q 'merge-upstream' findings.txt; then
-            echo "reported a call made with somebody else's secret"; exit 1
-          fi
-          if grep -q 'mirror: ungranted' findings.txt; then
-            echo "reported a step that has no token as a permissions problem"; exit 1
-          fi
-          ungranted examples | grep -q 'authenticated with a different secret'
-          ungranted examples | grep -q 'nothing in scope sets GH_TOKEN'
-
-      - name: write the two fixtures
+      - name: write the fixtures
         # Assembled in Python rather than written with a heredoc. Actions
         # substitutes workflow expressions throughout a run: block before the
         # shell ever sees it, quoted heredoc or not, so a fixture written that
@@ -119,24 +104,114 @@ jobs:
         run: |
           python - <<'PY'
           import pathlib
+          import shutil
           token = "${" + "{ github.token }}"
           head = "name: ci\n'on': push\n"
           job = (
               "jobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n"
               "      - env: {{ GH_TOKEN: '{t}' }}\n        run: {cmd}\n"
           )
+          names = []
           for name, perms, cmd in [
               ("noblock", "", "gh api -X DELETE repos/o/r/git/refs/heads/gone"),
               ("unknown", "permissions:\n  contents: read\n", 'gh api "$ENDPOINT"'),
+              # The witness for the opaque-step check further down: a command
+              # that is not a program in this repository, holding the workflow
+              # token. Nothing in examples/ is opaque, which is the whole
+              # point of examples/program -- so the proof that an unread
+              # command still gets reported has to be built here.
+              ("opaque", "permissions:\n  actions: read\n", "./not-in-this-repo --check"),
           ]:
               path = pathlib.Path(name, ".github", "workflows", "ci.yml")
               path.parent.mkdir(parents=True, exist_ok=True)
               path.write_text(head + perms + job.format(t=token, cmd=cmd))
+              names.append(str(path))
               print("---", path)
               print(path.read_text())
+
+          # The control for the two false-positive checks below: examples/,
+          # with the workflow token put in place of the other secret and in
+          # place of the step that has no token at all. Both calls become
+          # findings there, which is what makes their absence from examples/ a
+          # fact about token classification rather than a fact about nothing.
+          #
+          # Each edit is asserted to have landed. A control that silently
+          # stopped editing anything would be a second copy of examples/, and
+          # both witnesses below would pass by agreeing with the thing they
+          # are supposed to contradict.
+          shutil.copytree("examples", "control", dirs_exist_ok=True)
+          rel = pathlib.Path("control/.github/workflows/release.yml")
+          text = rel.read_text()
+          edits = [
+              ("${" + "{ secrets.MIRROR_PAT }}", token),
+              (
+                  "      - name: forgot the token\n        run:",
+                  "      - name: forgot the token\n"
+                  "        env:\n          GH_TOKEN: '" + token + "'\n        run:",
+              ),
+          ]
+          for before, after in edits:
+              if text.count(before) != 1:
+                  raise SystemExit(
+                      f"control: expected exactly one {before!r} in {rel}, "
+                      f"found {text.count(before)} -- examples/ has moved"
+                  )
+              text = text.replace(before, after)
+          rel.write_text(text)
+          names.append(str(rel))
+          print("---", rel)
+          print(rel.read_text())
+
+          pathlib.Path("fixtures.txt").write_text("\n".join(names) + "\n")
           PY
-          grep -q 'github.token' noblock/.github/workflows/ci.yml \
-            || { echo "the fixture lost the token expression"; exit 1; }
+          while read -r f; do
+            grep -q 'github.token' "$f" \
+              || { echo "$f lost the token expression"; exit 1; }
+          done < fixtures.txt
+
+      - name: the two calls this must not report are not reported
+        # A different secret and a missing token are both false positives if
+        # they turn up as findings. These are the assertions that keep them
+        # out.
+        #
+        # Both are negated, and a grep for a string that must be absent only
+        # keeps anything out while that string can still turn up. Rename the
+        # finding kind, or drop the call from examples/, and both pass forever
+        # over output that cannot contain what they name: green, asserting
+        # nothing, and nothing anywhere goes red to say so. That asymmetry is
+        # logbook#64 -- a positive assertion that rots turns CI red and
+        # somebody fixes it; a negated one that rots stays green.
+        #
+        # So each pattern is first required to appear in the control, where
+        # the same two steps hold the workflow token. Absent from examples/
+        # and present in the control is a fact about token classification.
+        # Absent from examples/ alone is a fact about nothing.
+        run: |
+          ungranted examples -q > findings.txt || test $? -le 1
+          ungranted examples > full.txt || test $? -le 1
+          ungranted control -q > control.txt || test $? -le 1
+          cat findings.txt
+          echo "--- control"
+          cat control.txt
+
+          # One witness per false positive, each naming the call it is about.
+          # A bare ':mirror: ungranted: ' would be satisfied by either of the
+          # two lines the control produces, so the second check could pass on
+          # the first call's evidence and witness nothing about the step that
+          # has no token.
+          grep -qF ':mirror: ungranted: gh api repos/other/mirror/merge-upstream' control.txt \
+            || { echo "the control does not report the other-secret call; it is not a control"; exit 1; }
+          grep -qF '/pulls needs pull-requests: read; this job has pull-requests: none' control.txt \
+            || { echo "the control does not report the tokenless call; it is not a control"; exit 1; }
+
+          if grep -qF 'merge-upstream' findings.txt; then
+            echo "reported a call made with somebody else's secret"; exit 1
+          fi
+          if grep -qF ':mirror: ungranted: ' findings.txt; then
+            echo "reported a step that has no token as a permissions problem"; exit 1
+          fi
+          grep -qF 'authenticated with a different secret' full.txt
+          grep -qF 'nothing in scope sets GH_TOKEN' full.txt
 
       - name: a workflow with no permissions block is clean and exits 0
         # The common safe case. If this ever starts reporting, the tool is
@@ -165,9 +240,21 @@ jobs:
           test "$code" -eq 1 || { echo "expected exit 1, got $code"; exit 1; }
           grep -q 'ledger.py: gh api repos/{}/{}/actions/workflows needs actions: read' program.txt
           grep -qx '1 finding in 1 of 1 job.' program.txt
+
+          # The witness for the check below, and its control. The opaque
+          # fixture runs a command that is not a program here, so this build
+          # does still report an unread command, in this wording, in this
+          # output. Reword the reason in core.py and this fails loudly instead
+          # of leaving the check below passing over a tool that has quietly
+          # stopped reading programs at all.
+          ungranted opaque > opaque.txt
+          cat opaque.txt
+          grep -qF 'may call the API itself' opaque.txt \
+            || { echo "an unreadable command is no longer reported opaque"; exit 1; }
+
           # Read, therefore not blind: the two scopes the program does use are
           # not reported as unused, and nothing is skipped for being opaque.
-          if grep -q 'may call the API itself' program.txt; then
+          if grep -qF 'may call the API itself' program.txt; then
             echo "the step was still opaque; the program was not read"; exit 1
           fi
 
