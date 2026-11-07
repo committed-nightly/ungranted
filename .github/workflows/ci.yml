@@ -194,10 +194,15 @@ jobs:
           echo "--- control"
           cat control.txt
 
-          grep -qF 'merge-upstream' control.txt \
-            || { echo "the control does not report merge-upstream; it is not a control"; exit 1; }
-          grep -qF ':mirror: ungranted: ' control.txt \
-            || { echo "the control reports no ungranted call in mirror; it is not a control"; exit 1; }
+          # One witness per false positive, each naming the call it is about.
+          # A bare ':mirror: ungranted: ' would be satisfied by either of the
+          # two lines the control produces, so the second check could pass on
+          # the first call's evidence and witness nothing about the step that
+          # has no token.
+          grep -qF ':mirror: ungranted: gh api repos/other/mirror/merge-upstream' control.txt \
+            || { echo "the control does not report the other-secret call; it is not a control"; exit 1; }
+          grep -qF '/pulls needs pull-requests: read; this job has pull-requests: none' control.txt \
+            || { echo "the control does not report the tokenless call; it is not a control"; exit 1; }
 
           if grep -qF 'merge-upstream' findings.txt; then
             echo "reported a call made with somebody else's secret"; exit 1
