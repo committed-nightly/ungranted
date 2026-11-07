@@ -92,21 +92,6 @@ jobs:
           grep -q 'contents: write is granted and every call here only reads' out.txt
           grep -qx '    covered' out.txt
 
-      - name: the two calls this must not report are not reported
-        # A different secret and a missing token are both false positives if
-        # they turn up as findings. This is the assertion that keeps them out.
-        run: |
-          ungranted examples -q > findings.txt || test $? -le 1
-          cat findings.txt
-          if grep -q 'merge-upstream' findings.txt; then
-            echo "reported a call made with somebody else's secret"; exit 1
-          fi
-          if grep -q 'mirror: ungranted' findings.txt; then
-            echo "reported a step that has no token as a permissions problem"; exit 1
-          fi
-          ungranted examples | grep -q 'authenticated with a different secret'
-          ungranted examples | grep -q 'nothing in scope sets GH_TOKEN'
-
       - name: write the fixtures
         # Assembled in Python rather than written with a heredoc. Actions
         # substitutes workflow expressions throughout a run: block before the
@@ -119,6 +104,7 @@ jobs:
         run: |
           python - <<'PY'
           import pathlib
+          import shutil
           token = "${" + "{ github.token }}"
           head = "name: ci\n'on': push\n"
           job = (
@@ -142,12 +128,85 @@ jobs:
               names.append(str(path))
               print("---", path)
               print(path.read_text())
+
+          # The control for the two false-positive checks below: examples/,
+          # with the workflow token put in place of the other secret and in
+          # place of the step that has no token at all. Both calls become
+          # findings there, which is what makes their absence from examples/ a
+          # fact about token classification rather than a fact about nothing.
+          #
+          # Each edit is asserted to have landed. A control that silently
+          # stopped editing anything would be a second copy of examples/, and
+          # both witnesses below would pass by agreeing with the thing they
+          # are supposed to contradict.
+          shutil.copytree("examples", "control", dirs_exist_ok=True)
+          rel = pathlib.Path("control/.github/workflows/release.yml")
+          text = rel.read_text()
+          edits = [
+              ("${" + "{ secrets.MIRROR_PAT }}", token),
+              (
+                  "      - name: forgot the token\n        run:",
+                  "      - name: forgot the token\n"
+                  "        env:\n          GH_TOKEN: '" + token + "'\n        run:",
+              ),
+          ]
+          for before, after in edits:
+              if text.count(before) != 1:
+                  raise SystemExit(
+                      f"control: expected exactly one {before!r} in {rel}, "
+                      f"found {text.count(before)} -- examples/ has moved"
+                  )
+              text = text.replace(before, after)
+          rel.write_text(text)
+          names.append(str(rel))
+          print("---", rel)
+          print(rel.read_text())
+
           pathlib.Path("fixtures.txt").write_text("\n".join(names) + "\n")
           PY
           while read -r f; do
             grep -q 'github.token' "$f" \
               || { echo "$f lost the token expression"; exit 1; }
           done < fixtures.txt
+
+      - name: the two calls this must not report are not reported
+        # A different secret and a missing token are both false positives if
+        # they turn up as findings. These are the assertions that keep them
+        # out.
+        #
+        # Both are negated, and a grep for a string that must be absent only
+        # keeps anything out while that string can still turn up. Rename the
+        # finding kind, or drop the call from examples/, and both pass forever
+        # over output that cannot contain what they name: green, asserting
+        # nothing, and nothing anywhere goes red to say so. That asymmetry is
+        # logbook#64 -- a positive assertion that rots turns CI red and
+        # somebody fixes it; a negated one that rots stays green.
+        #
+        # So each pattern is first required to appear in the control, where
+        # the same two steps hold the workflow token. Absent from examples/
+        # and present in the control is a fact about token classification.
+        # Absent from examples/ alone is a fact about nothing.
+        run: |
+          ungranted examples -q > findings.txt || test $? -le 1
+          ungranted examples > full.txt || test $? -le 1
+          ungranted control -q > control.txt || test $? -le 1
+          cat findings.txt
+          echo "--- control"
+          cat control.txt
+
+          grep -qF 'merge-upstream' control.txt \
+            || { echo "the control does not report merge-upstream; it is not a control"; exit 1; }
+          grep -qF ':mirror: ungranted: ' control.txt \
+            || { echo "the control reports no ungranted call in mirror; it is not a control"; exit 1; }
+
+          if grep -qF 'merge-upstream' findings.txt; then
+            echo "reported a call made with somebody else's secret"; exit 1
+          fi
+          if grep -qF ':mirror: ungranted: ' findings.txt; then
+            echo "reported a step that has no token as a permissions problem"; exit 1
+          fi
+          grep -qF 'authenticated with a different secret' full.txt
+          grep -qF 'nothing in scope sets GH_TOKEN' full.txt
 
       - name: a workflow with no permissions block is clean and exits 0
         # The common safe case. If this ever starts reporting, the tool is
